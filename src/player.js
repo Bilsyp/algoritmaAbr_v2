@@ -1,6 +1,6 @@
 import shaka from "shaka-player";
 import { BufferManager } from "./buffer";
-const manifestUri = "http://localhost:3000/stream/video/anime/playlist.mpd";
+const manifestUri = "http://localhost:3000/stream/video/aot/playlist.mpd";
 
 function initApp() {
   // Install built-in polyfills to patch browser incompatibilities.
@@ -38,7 +38,7 @@ async function initPlayer() {
 
   player.configure(
     "abrFactory",
-    () => new BufferManager(() => player?.getBufferFullness())
+    () => new BufferManager(() => player?.getBufferFullness(), player)
   );
   video.onloadedmetadata = (e) => {
     const bufferingGoal = calculateDuration(video.duration);
@@ -52,6 +52,7 @@ async function initPlayer() {
 
   video.ontimeupdate = () => {
     const stats = player.getStats();
+    const network = player.getNetworkingEngine();
   };
   // Try to load a manifest.
   // This is an asynchronous process.

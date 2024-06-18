@@ -9,21 +9,21 @@
  * downloads.
  */
 export class BufferManager {
-  constructor(getBufferFullnessCallback) {
+  constructor(getBufferFullnessCallback, player) {
     this.switchQualityCallback = null;
     this.mediaElement = null;
     this.enabled_ = false;
-
+    this.player = player;
     this.videoVariants = [];
     this.getBufferFullness = getBufferFullnessCallback;
     this.downloadedSegments = [];
+    this.failedSegments = [];
     this.playbackRate = 1;
     this.isStartupComplete = false;
     this.playbackRate_ = 1;
     this.monitorInterval = 1000;
     this.lastQualityChangeTime = null;
     this.config_ = null;
-
     this.cmsdManager = null;
     this.lastDownloadedSegments = null;
     this.highBufferThreshold = 0.8;
@@ -31,8 +31,10 @@ export class BufferManager {
     this.bufferPercentage = 10;
     this.currentQualityIndex = 0;
     this.bufferLevel = 0;
+
     this.startMonitoring();
     this.startMonitoringBuffer();
+    this.setupErrorHandling();
   }
 
   init(switchQualityCallback) {
@@ -48,12 +50,13 @@ export class BufferManager {
     this.isEnabled = false;
     this.videoVariants = [];
     this.playbackRate = 1;
-
     this.lastQualityChangeTime = null;
+
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
       this.resizeObserver = null;
     }
+
     this.cmsdManager = null;
   }
 
@@ -63,17 +66,9 @@ export class BufferManager {
     this.videoVariants = variants;
   }
 
-  /**
-   * Chooses the appropriate video variant based on the current buffer level.
-   * If the buffer level is below the low buffer threshold, the quality is decreased.
-   * If the buffer level is above the high buffer threshold, the quality is increased.
-   * The chosen variant is returned.
-   *
-   * @param {boolean} [preferFastSwitching] - Whether to prefer fast switching over quality.
-   * @returns {Object} - The chosen video variant.
-   */
   chooseVariant(preferFastSwitching) {
     const bufferLevel = this.bufferLevel;
+
     if (bufferLevel < this.lowBufferThreshold) {
       this.decreaseQuality();
     } else if (bufferLevel > this.highBufferThreshold) {
@@ -89,7 +84,6 @@ export class BufferManager {
       this.restrictions(
         this.getVariantByQualityIndex(this.currentQualityIndex).bandwidth
       );
-      console.log(`Decreasing quality to: ${this.currentQualityIndex}`);
     }
   }
 
@@ -101,10 +95,9 @@ export class BufferManager {
       this.restrictions(
         this.getVariantByQualityIndex(this.currentQualityIndex).bandwidth
       );
-      this.config_.restrictToScreenSize = true;
-      console.log(`Increasing quality to: ${this.currentQualityIndex}`);
     }
   }
+
   enable() {
     this.enabled_ = true;
   }
@@ -114,11 +107,11 @@ export class BufferManager {
   }
 
   startMonitoringBuffer() {
-    // this.config_.useNetworkInformation = false;
-
     const bufferFullness = this.getBufferFullness().toFixed(1);
     this.bufferLevel = bufferFullness;
+
     const chosenVariant = this.chooseVariant();
+
     if (chosenVariant) {
       this.switchQualityCallback(
         chosenVariant,
@@ -127,9 +120,11 @@ export class BufferManager {
       );
     }
   }
+
   restrictions(bandwidth) {
     this.config_.restrictions.maxBandwidth = bandwidth;
   }
+
   getDownloadedSegments() {
     return this.downloadedSegments;
   }
@@ -140,29 +135,22 @@ export class BufferManager {
     );
     return sortedVariants[qualityIndex];
   }
-  /**
-   * Handles the completion of a segment download.
-   *
-   * @param {number} deltaTimeMs - The duration, in milliseconds, that the request took to complete.
-   * @param {number} numBytes - The total number of bytes transferred.
-   * @param {boolean} allowSwitch - Indicate if the segment is allowed to switch to another stream.
-   * @param {shaka.extern.Request} [request] - A reference to the request.
-   */
+
   segmentDownloaded(deltaTimeMs, numBytes, allowSwitch, request) {
     if (allowSwitch) {
       this.startMonitoringBuffer();
     }
 
-    // Menghitung latency
-    const liveLatency = deltaTimeMs + (request.timeToFirstByte || 0); // Menggunakan 0 jika timeToFirstByte tidak didefinisikan
-    // console.log(`Latency: ${liveLatency} ms`);
-
-    // Mencatat data segmen yang diunduh
+    const liveLatency = deltaTimeMs + (request.timeToFirstByte || 0);
+    const segmentDelay =
+      Date.now() - request.requestStartTime + (request.timeToFirstByte || 0);
     const segmentData = {
       contentType: request.contentType,
       timestamp: Date.now(),
       latency: liveLatency,
+      delay: segmentDelay,
     };
+
     this.downloadedSegments.push(segmentData);
   }
 
@@ -173,12 +161,51 @@ export class BufferManager {
         (segment) => currentTime - segment.timestamp <= 5000
       );
       this.lastDownloadedSegmentsCount = recentSegments.length;
-      console.log(this.calculateDelay());
-      // console.log(
-      //   `Segments fetched in the last 5 seconds: ${this.lastDownloadedSegmentsCount}`
-      // );
-    }, 5000);
+      const stats = new DisplayStats(this.getLatencyStatistics());
+      stats.displayToContainer();
+    }, 1000);
   }
+
+  calculateJitter() {
+    const delays = this.downloadedSegments.map((segment) => segment.delay);
+
+    if (delays.length < 2) {
+      return 0;
+    }
+
+    const meanDelay =
+      delays.reduce((sum, delay) => sum + delay, 0) / delays.length;
+    const sumSquaredDifferences = delays.reduce(
+      (sum, delay) => sum + Math.pow(delay - meanDelay, 2),
+      0
+    );
+    const jitter = Math.sqrt(sumSquaredDifferences / (delays.length - 1));
+
+    return Math.round(jitter) / 1000;
+  }
+
+  setupErrorHandling() {
+    this.player
+      .getNetworkingEngine()
+      .registerResponseFilter((type, response) => {
+        if (response.status >= 400) {
+          const failedSegment = {
+            uri: response.uri,
+            timestamp: Date.now(),
+            status: response.status,
+          };
+          this.failedSegments.push(failedSegment);
+          console.error(
+            `Failed to download segment: ${response.uri}, Status: ${response.status}`
+          );
+        }
+      });
+  }
+
+  getFailedSegments() {
+    return this.failedSegments;
+  }
+
   calculateDelay(videoTimestamp, audioTimestamp) {
     this.downloadedSegments.forEach((item) => {
       if (item.contentType === "video") {
@@ -187,8 +214,10 @@ export class BufferManager {
         audioTimestamp = item.timestamp;
       }
     });
+
     return Math.abs(videoTimestamp - audioTimestamp);
   }
+
   getLatencyStatistics() {
     if (this.downloadedSegments.length === 0) {
       return null;
@@ -221,5 +250,23 @@ export class BufferManager {
 
   configure(config) {
     this.config_ = config;
+  }
+}
+class DisplayStats {
+  constructor(liveLatency) {
+    this.displayedFrames = 0;
+    this.droppedFrames = 0;
+    this.totalFrames = 0;
+    this.totalDroppedFrames = 0;
+    this.decodedFrames = 0;
+    this.totalDecodedFrames = 0;
+    this.latency = 0;
+    this.liveLatency = liveLatency;
+    this.delaySegments = [];
+    this.jitterSegments = [];
+  }
+  displayToContainer() {
+    const liveLatency = document.getElementById("liveLatency");
+    liveLatency.innerText = this.liveLatency.averageLatency.toFixed(2);
   }
 }
